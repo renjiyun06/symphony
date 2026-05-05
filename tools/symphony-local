@@ -17,7 +17,8 @@ Options:
       --host HOST             Require workflow server.host to match HOST. Symphony
                               currently reads host from WORKFLOW.md, not CLI.
   -e, --env-file PATH         Env file to source. Default: $SYMPHONY_ENV_FILE or
-                              /home/lamarck/.symphony/env/linear.env.
+                              /home/lamarck/.symphony/env/linear.env. If a
+                              sibling gitee.env exists, it is sourced too.
       --engine-dir PATH       Symphony Elixir dir. Default: $SYMPHONY_DIR or
                               /home/lamarck/aion/symphony/elixir.
       --mise PATH             mise executable. Default: $MISE or
@@ -164,6 +165,11 @@ fi
 if [ -f "$ENV_FILE" ]; then
   # shellcheck disable=SC1090
   . "$ENV_FILE"
+fi
+EXTRA_ENV_FILE="$(dirname "$ENV_FILE")/gitee.env"
+if [ -f "$EXTRA_ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$EXTRA_ENV_FILE"
 fi
 
 if [ -z "${LINEAR_API_KEY:-}" ]; then

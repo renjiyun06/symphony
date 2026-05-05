@@ -18,11 +18,15 @@ Options:
       --host HOST             Check workflow server.host matches HOST. Default:
                               $SYMPHONY_HOST if set; otherwise no host check.
   -e, --env-file PATH         Env file to source. Default: $SYMPHONY_ENV_FILE or
-                              /home/lamarck/.symphony/env/linear.env.
+                              /home/lamarck/.symphony/env/linear.env. If a
+                              sibling gitee.env exists, it is sourced too.
       --engine-dir PATH       Symphony Elixir dir. Default: $SYMPHONY_DIR or
                               /home/lamarck/aion/symphony/elixir.
       --mise PATH             mise executable. Default: $MISE or
                               /home/lamarck/.local/bin/mise.
+      --repo-url URL          Optional managed-repo remote to check with
+                              `git ls-remote`. Default: x_repository.remote or
+                              repository.remote in WORKFLOW.md, if present.
   -h, --help                  Show this help.
 
 Checks:
@@ -30,7 +34,10 @@ Checks:
   - workspace.root is configured and writable.
   - local env file exists, has permission 600, and provides LINEAR_API_KEY.
   - Symphony binary exists under the selected engine dir.
-  - required commands exist: git, gh, codex, mise.
+  - required commands exist: git, codex, mise.
+  - optional GitHub CLI is reported when present, but is not required for
+    non-GitHub projects such as Gitee-hosted repositories.
+  - optional managed repo remote is reachable without interactive prompts.
   - Linear API is reachable.
   - selected port is not already listening.
   - server.host matches --host when provided.
@@ -38,6 +45,7 @@ Checks:
 Examples:
   symphony-check /home/lamarck/forge-ai/loom/.symphony/WORKFLOW.md
   symphony-check --port 4001 --host 0.0.0.0 /home/lamarck/forge-ai/loom/.symphony/WORKFLOW.md
+  symphony-check --repo-url git@gitee.com:renjiyun/rxy.git /home/lamarck/forge-ai/rxy/.symphony/WORKFLOW.md
 USAGE
 }
 
@@ -52,6 +60,7 @@ HOST="${SYMPHONY_HOST:-}"
 ENV_FILE="${SYMPHONY_ENV_FILE:-/home/lamarck/.symphony/env/linear.env}"
 SYMPHONY_DIR="${SYMPHONY_DIR:-/home/lamarck/aion/symphony/elixir}"
 MISE="${MISE:-/home/lamarck/.local/bin/mise}"
+REPO_URL="${SYMPHONY_REPO_URL:-}"
 WF=""
 
 while [ "$#" -gt 0 ]; do
@@ -105,6 +114,15 @@ while [ "$#" -gt 0 ]; do
       MISE="${1#*=}"
       shift
       ;;
+    --repo-url)
+      [ "$#" -ge 2 ] || die "$1 requires a URL"
+      REPO_URL="$2"
+      shift 2
+      ;;
+    --repo-url=*)
+      REPO_URL="${1#*=}"
+      shift
+      ;;
     -*)
       die "unknown option: $1"
       ;;
@@ -132,22 +150,33 @@ WF="$(cd "$(dirname "$WF")" && pwd)/$(basename "$WF")"
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+redact_url() { printf '%s' "$1" | sed -E 's#(https://)[^/@:]+(:[^/@]+)?@#\1[REDACTED]@#g'; }
 ok=1
 check_cmd() { if command -v "$1" >/dev/null 2>&1; then green "ok: command $1"; else red "missing: command $1"; ok=0; fi; }
+check_optional_cmd() { if command -v "$1" >/dev/null 2>&1; then green "ok: optional command $1"; else yellow "optional: command $1 not found"; fi; }
 check_path() { if [ -e "$1" ]; then green "ok: $1"; else red "missing: $1"; ok=0; fi; }
+
+frontmatter_value() {
+  python3 - "$WF" "$1" <<'PY'
+import sys, re
+path, dotted = sys.argv[1], sys.argv[2]
+text = open(path).read()
+front = text.split('---', 2)[1] if text.startswith('---') and text.count('---') >= 2 else text
+parts = dotted.split('.')
+if len(parts) == 1:
+    m = re.search(r'(?m)^%s:\s*(.+?)\s*$' % re.escape(parts[0]), front)
+else:
+    parent, child = parts[0], parts[1]
+    m = re.search(r'(?m)^%s:\n(?:  .*\n)*?  %s:\s*(.+?)\s*$' % (re.escape(parent), re.escape(child)), front)
+print(m.group(1).strip().strip('"\'') if m else '')
+PY
+}
 
 echo "== Symphony workflow instance =="
 check_path "$WF"
 if grep -q 'TODO-linear-project-slug' "$WF"; then yellow "todo: replace TODO-linear-project-slug in $WF"; ok=0; else green "ok: Linear project slug is set"; fi
 
-WORKFLOW_HOST=$(python3 - "$WF" <<'PY'
-import sys,re
-text=open(sys.argv[1]).read()
-front=text.split('---', 2)[1] if text.startswith('---') and text.count('---') >= 2 else text
-m=re.search(r'(?m)^server:\n(?:  .*\n)*?  host:\s*(.+?)\s*$', front)
-print(m.group(1).strip().strip('"\'') if m else '')
-PY
-)
+WORKFLOW_HOST=$(frontmatter_value server.host)
 if [ -n "$HOST" ]; then
   if [ "$WORKFLOW_HOST" = "$HOST" ]; then
     green "ok: server.host is $HOST"
@@ -160,13 +189,7 @@ elif [ -n "$WORKFLOW_HOST" ]; then
 else
   yellow "note: server.host not set; Symphony default may bind loopback only"
 fi
-WORKSPACE_ROOT=$(python3 - "$WF" <<'PY'
-import sys,re
-text=open(sys.argv[1]).read()
-m=re.search(r'(?m)^workspace:\n(?:  .*\n)*?  root:\s*(.+?)\s*$', text)
-print(m.group(1).strip().strip('"\'') if m else '')
-PY
-)
+WORKSPACE_ROOT=$(frontmatter_value workspace.root)
 if [ -n "$WORKSPACE_ROOT" ]; then
   green "ok: workspace root configured: $WORKSPACE_ROOT"
   mkdir -p "$WORKSPACE_ROOT" 2>/tmp/symphony-check-mkdir.err || true
@@ -174,6 +197,13 @@ if [ -n "$WORKSPACE_ROOT" ]; then
 else
   yellow "todo: no workspace.root found in workflow"
   ok=0
+fi
+REPOSITORY_PROVIDER=$(frontmatter_value x_repository.provider)
+if [ -z "$REPO_URL" ]; then
+  REPO_URL=$(frontmatter_value x_repository.remote)
+fi
+if [ -z "$REPO_URL" ]; then
+  REPO_URL=$(frontmatter_value repository.remote)
 fi
 
 echo
@@ -186,14 +216,43 @@ if [ -f "$ENV_FILE" ]; then
   # shellcheck disable=SC1090
   . "$ENV_FILE"
 fi
+EXTRA_ENV_FILE="$(dirname "$ENV_FILE")/gitee.env"
+if [ -f "$EXTRA_ENV_FILE" ]; then
+  perm=$(stat -c '%a' "$EXTRA_ENV_FILE" 2>/dev/null || true)
+  if [ "$perm" = "600" ]; then green "ok: extra env file permission 600: $EXTRA_ENV_FILE"; else yellow "todo: set extra env file permission to 600 (current: ${perm:-unknown})"; ok=0; fi
+  # shellcheck disable=SC1090
+  . "$EXTRA_ENV_FILE"
+fi
 check_path "$SYMPHONY_DIR/bin/symphony"
 if [ -x "$SYMPHONY_DIR/bin/symphony" ]; then green "ok: Symphony binary executable"; else red "not executable: $SYMPHONY_DIR/bin/symphony"; ok=0; fi
 check_cmd git
-check_cmd gh
 check_cmd codex
 check_cmd "$MISE"
+check_optional_cmd gh
 
 if [ -n "${LINEAR_API_KEY:-}" ]; then green "ok: LINEAR_API_KEY is set from local env"; else yellow "todo: configure LINEAR_API_KEY in $ENV_FILE or export it"; ok=0; fi
+if [ "$REPOSITORY_PROVIDER" = "gitee" ]; then
+  if [ -n "${GITEE_ACCESS_TOKEN:-}" ]; then green "ok: GITEE_ACCESS_TOKEN is set from local env"; else yellow "note: GITEE_ACCESS_TOKEN not set; Gitee PR automation will be disabled"; fi
+  if [ -n "${RXY_REPO_URL:-}" ] && [ -z "${SYMPHONY_REPO_URL:-}" ]; then REPO_URL="$RXY_REPO_URL"; fi
+else
+  yellow "skipped: Gitee-specific env checks for provider ${REPOSITORY_PROVIDER:-<unset>}"
+fi
+
+echo
+
+echo "== managed repo remote =="
+if [ -n "$REPO_URL" ]; then
+  safe_repo_url=$(redact_url "$REPO_URL")
+  if GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new' git ls-remote --heads "$REPO_URL" main >/tmp/symphony-check-lsremote.out 2>/tmp/symphony-check-lsremote.err; then
+    green "ok: repo remote reachable: $safe_repo_url"
+  else
+    yellow "repo remote not reachable non-interactively: $safe_repo_url"
+    sed -E 's#(https://)[^/@:]+(:[^/@]+)?@#\1[REDACTED]@#g' /tmp/symphony-check-lsremote.err | sed -n '1,4p'
+    ok=0
+  fi
+else
+  yellow "note: no --repo-url or x_repository.remote found; skipping repo reachability check"
+fi
 
 echo
 
@@ -211,6 +270,22 @@ echo "== Linear API =="
 if [ -n "${LINEAR_API_KEY:-}" ]; then
   linear_check=$(curl -sS https://api.linear.app/graphql -H "Content-Type: application/json" -H "Authorization: $LINEAR_API_KEY" --data '{"query":"query { organization { name urlKey } }"}' 2>/tmp/symphony-linear.err)
   if printf '%s' "$linear_check" | jq -e '.data.organization.urlKey == "forge-ai-0"' >/dev/null 2>&1; then green "ok: Linear API reachable for forge-ai-0"; else red "not ready: Linear API check failed"; printf '%s\n' "$linear_check" | jq '{data:.data, errors:.errors}' 2>/dev/null || printf '%s\n' "$linear_check"; ok=0; fi
+fi
+
+echo
+
+echo "== Gitee API =="
+if [ "$REPOSITORY_PROVIDER" = "gitee" ]; then
+  if [ -n "${GITEE_ACCESS_TOKEN:-}" ]; then
+    gitee_owner="${GITEE_OWNER:-renjiyun}"
+    gitee_repo="${GITEE_REPO:-rxy}"
+    gitee_check=$(curl -sS "https://gitee.com/api/v5/repos/${gitee_owner}/${gitee_repo}/pulls?access_token=${GITEE_ACCESS_TOKEN}&state=open&per_page=1" 2>/tmp/symphony-gitee.err)
+    if printf '%s' "$gitee_check" | jq -e 'type == "array"' >/dev/null 2>&1; then green "ok: Gitee API reachable for ${gitee_owner}/${gitee_repo} pulls"; else red "not ready: Gitee API pull request check failed"; printf '%s\n' "$gitee_check" | jq '{message:.message, error:.error}' 2>/dev/null || printf '%s\n' "$gitee_check"; ok=0; fi
+  else
+    yellow "skipped: GITEE_ACCESS_TOKEN is not configured"
+  fi
+else
+  yellow "skipped: workflow provider is ${REPOSITORY_PROVIDER:-<unset>}, not gitee"
 fi
 
 echo
