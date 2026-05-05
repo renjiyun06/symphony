@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  symphony-local [OPTIONS] <path-to-WORKFLOW.md> [-- SYMPHONY_ARGS...]
+
+Start a local Symphony instance. The instance itself is defined by the
+WORKFLOW.md path; this wrapper supplies only local-machine conventions.
+
+Arguments:
+  <path-to-WORKFLOW.md>       Workflow file that defines the Symphony instance.
+
+Options:
+  -p, --port PORT             Dashboard/API port. Default: $SYMPHONY_PORT or 4000.
+      --host HOST             Require workflow server.host to match HOST. Symphony
+                              currently reads host from WORKFLOW.md, not CLI.
+  -e, --env-file PATH         Env file to source. Default: $SYMPHONY_ENV_FILE or
+                              /home/lamarck/.symphony/env/linear.env.
+      --engine-dir PATH       Symphony Elixir dir. Default: $SYMPHONY_DIR or
+                              /home/lamarck/aion/symphony/elixir.
+      --mise PATH             mise executable. Default: $MISE or
+                              /home/lamarck/.local/bin/mise.
+  -n, --dry-run               Print the resolved command; do not start Symphony.
+  -h, --help                  Show this help.
+
+Environment:
+  LINEAR_API_KEY              May be exported directly, otherwise loaded from env file.
+  SYMPHONY_PORT               Default port when --port is omitted.
+  SYMPHONY_HOST               Default host check when --host is omitted. Optional.
+  SYMPHONY_ENV_FILE           Default env file when --env-file is omitted.
+  SYMPHONY_DIR                Default engine dir when --engine-dir is omitted.
+  MISE                        Default mise executable when --mise is omitted.
+
+Examples:
+  symphony-local /home/lamarck/forge-ai/loom/.symphony/WORKFLOW.md
+  symphony-local --port 4001 --host 0.0.0.0 /home/lamarck/forge-ai/loom/.symphony/WORKFLOW.md
+  SYMPHONY_PORT=4002 symphony-local /home/lamarck/forge-ai/loom/.symphony/WORKFLOW.md
+  symphony-local --dry-run /home/lamarck/forge-ai/loom/.symphony/WORKFLOW.md
+
+Use `--` to pass additional arguments through to the underlying Symphony binary:
+  symphony-local --port 4001 WORKFLOW.md -- --logs-root /tmp/symphony-logs
+USAGE
+}
+
+die() {
+  echo "error: $*" >&2
+  echo "Try: symphony-local --help" >&2
+  exit 2
+}
+
+PORT="${SYMPHONY_PORT:-4000}"
+HOST="${SYMPHONY_HOST:-}"
+ENV_FILE="${SYMPHONY_ENV_FILE:-/home/lamarck/.symphony/env/linear.env}"
+SYMPHONY_DIR="${SYMPHONY_DIR:-/home/lamarck/aion/symphony/elixir}"
+MISE="${MISE:-/home/lamarck/.local/bin/mise}"
+DRY_RUN=0
+WF=""
+EXTRA_ARGS=()
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -p|--port)
+      [ "$#" -ge 2 ] || die "$1 requires a port"
+      PORT="$2"
+      shift 2
+      ;;
+    --port=*)
+      PORT="${1#*=}"
+      shift
+      ;;
+    -e|--env-file)
+      [ "$#" -ge 2 ] || die "$1 requires a path"
+      ENV_FILE="$2"
+      shift 2
+      ;;
+    --env-file=*)
+      ENV_FILE="${1#*=}"
+      shift
+      ;;
+    --host)
+      [ "$#" -ge 2 ] || die "$1 requires a host"
+      HOST="$2"
+      shift 2
+      ;;
+    --host=*)
+      HOST="${1#*=}"
+      shift
+      ;;
+    --engine-dir)
+      [ "$#" -ge 2 ] || die "$1 requires a path"
+      SYMPHONY_DIR="$2"
+      shift 2
+      ;;
+    --engine-dir=*)
+      SYMPHONY_DIR="${1#*=}"
+      shift
+      ;;
+    --mise)
+      [ "$#" -ge 2 ] || die "$1 requires a path"
+      MISE="$2"
+      shift 2
+      ;;
+    --mise=*)
+      MISE="${1#*=}"
+      shift
+      ;;
+    -n|--dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --)
+      shift
+      EXTRA_ARGS=("$@")
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      if [ -n "$WF" ]; then
+        die "unexpected extra positional argument: $1; use -- before Symphony args"
+      fi
+      WF="$1"
+      shift
+      ;;
+  esac
+done
+
+[ -n "$WF" ] || die "missing WORKFLOW.md path"
+[[ "$PORT" =~ ^[0-9]+$ ]] || die "port must be numeric: $PORT"
+if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+  die "port must be between 1 and 65535: $PORT"
+fi
+
+if [ ! -f "$WF" ]; then
+  echo "Missing WORKFLOW.md: $WF" >&2
+  exit 1
+fi
+WF="$(cd "$(dirname "$WF")" && pwd)/$(basename "$WF")"
+
+
+if [ -n "$HOST" ]; then
+  WORKFLOW_HOST=$(python3 - "$WF" <<'PY'
+import sys,re
+text=open(sys.argv[1]).read()
+front=text.split('---', 2)[1] if text.startswith('---') and text.count('---') >= 2 else text
+m=re.search(r'(?m)^server:\n(?:  .*\n)*?  host:\s*(.+?)\s*$', front)
+print(m.group(1).strip().strip('"\'') if m else '')
+PY
+)
+  if [ "$WORKFLOW_HOST" != "$HOST" ]; then
+    echo "Workflow server.host is '${WORKFLOW_HOST:-<unset>}', expected '$HOST'." >&2
+    echo "Symphony reads host from WORKFLOW.md; update the workflow or omit --host." >&2
+    exit 1
+  fi
+fi
+
+if [ -f "$ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+fi
+
+if [ -z "${LINEAR_API_KEY:-}" ]; then
+  echo "Missing LINEAR_API_KEY. Put it in $ENV_FILE or export it before running." >&2
+  exit 1
+fi
+
+if [ ! -x "$SYMPHONY_DIR/bin/symphony" ]; then
+  echo "Missing Symphony binary. Run: cd $SYMPHONY_DIR && $MISE trust && $MISE exec -- mix setup && $MISE exec -- mix build" >&2
+  exit 1
+fi
+
+CMD=("$MISE" exec -- ./bin/symphony \
+  --i-understand-that-this-will-be-running-without-the-usual-guardrails \
+  --port "$PORT")
+if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
+  CMD+=("${EXTRA_ARGS[@]}")
+fi
+CMD+=("$WF")
+
+echo "Starting Symphony"
+echo "  workflow: $WF"
+echo "  engine: $SYMPHONY_DIR/bin/symphony"
+echo "  env: $ENV_FILE"
+if [ -n "$HOST" ]; then echo "  host: $HOST"; fi
+echo "  port: $PORT"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  printf '  command:'
+  printf ' %q' "${CMD[@]}"
+  printf '\n'
+  exit 0
+fi
+
+cd "$SYMPHONY_DIR"
+exec "${CMD[@]}"
