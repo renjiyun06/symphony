@@ -786,6 +786,40 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "attempt=3"
   end
 
+  test "workflow parser preserves UTF-8 prompt text across frontmatter split" do
+    write_workflow_file!(
+      Workflow.workflow_file_path(),
+      prompt: "Repository context:\n- Project: FZB / 富筑帮建材批发商城.\n- Sources: `额外补充需求.md`."
+    )
+
+    {:ok, %{prompt_template: prompt}} = Workflow.current()
+
+    assert String.valid?(prompt)
+    assert prompt =~ "富筑帮建材批发商城"
+    assert prompt =~ "额外补充需求.md"
+  end
+
+  test "prompt builder renders non-ASCII issue text as valid UTF-8" do
+    workflow_prompt = "You are working on FZB / 富筑帮 ticket {{ issue.identifier }} {{ issue.title }}\n\n{{ issue.description }}"
+
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
+
+    issue = %Issue{
+      identifier: "FOR-8",
+      title: "补充富筑帮项目 README 与架构文档",
+      description: "富筑帮当前是一个 monorepo，基于 RuoYi-Vue-Plus。",
+      state: "Todo",
+      url: "https://example.org/issues/FOR-8",
+      labels: ["文档"]
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert String.valid?(prompt)
+    assert prompt =~ "富筑帮"
+    assert {:ok, _json} = Jason.encode(%{"text" => prompt})
+  end
+
   test "prompt builder renders issue datetime fields without crashing" do
     workflow_prompt = "Ticket {{ issue.identifier }} created={{ issue.created_at }} updated={{ issue.updated_at }}"
 

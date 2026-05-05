@@ -22,7 +22,7 @@ defmodule SymphonyElixir.PromptBuilder do
       },
       @render_opts
     )
-    |> IO.iodata_to_binary()
+    |> IO.chardata_to_string()
   end
 
   defp prompt_template!({:ok, %{prompt_template: prompt}}), do: default_prompt(prompt)
